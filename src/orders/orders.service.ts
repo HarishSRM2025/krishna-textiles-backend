@@ -50,6 +50,8 @@ export class OrdersService {
     status?: OrderStatus;
     search?: string;
     customerId?: string;
+    customerEmail?: string;
+    customerPhone?: string;
     page?: number;
     limit?: number;
   }) {
@@ -67,6 +69,12 @@ export class OrdersService {
     }
     if (params.customerId) {
       where.customerId = params.customerId;
+    }
+    if (params.customerEmail) {
+      where.customerEmail = { equals: params.customerEmail, mode: 'insensitive' };
+    }
+    if (params.customerPhone) {
+      where.customerPhone = params.customerPhone;
     }
     if (params.search) {
       where.OR = [

@@ -68,7 +68,10 @@ export class AuthService {
     return { success: true, message: 'Logged out successfully.' };
   }
 
-  async register(data: { email: string; password: string; name: string; phone?: string; role?: any }) {
+  async register(
+    data: { email: string; password: string; name: string; phone?: string; role?: any },
+    meta?: { ipAddress?: string; userAgent?: string },
+  ) {
     if (!data?.email || typeof data.email !== 'string' || !data?.password || typeof data.password !== 'string') {
       throw new BadRequestException('Valid email and password are required.');
     }
@@ -80,6 +83,7 @@ export class AuthService {
       throw new BadRequestException('User with this email already exists.');
     }
 
+    const role = data.role === 'ADMIN' ? 'ADMIN' : 'CUSTOMER';
     const passwordHash = await bcrypt.hash(data.password, 10);
     const user = await this.prisma.user.create({
       data: {
@@ -87,15 +91,52 @@ export class AuthService {
         passwordHash,
         name: data.name,
         phone: data.phone,
-        role: data.role || 'ADMIN',
+        role,
       },
     });
 
+    if (role === 'CUSTOMER' && data.phone) {
+      const existingCust = await this.prisma.customer.findUnique({
+        where: { phone: data.phone },
+      });
+      if (!existingCust) {
+        await this.prisma.customer.create({
+          data: {
+            name: data.name,
+            phone: data.phone,
+            email: data.email.toLowerCase().trim(),
+            type: 'RETAIL',
+          },
+        }).catch(() => {});
+      }
+    }
+
+    const payload = { sub: user.id, email: user.email, role: user.role };
+    const accessToken = this.jwtService.sign(payload);
+
+    // Create persistent session
+    const session = await this.sessionService.createSession({
+      userId: user.id,
+      token: accessToken,
+      ipAddress: meta?.ipAddress,
+      userAgent: meta?.userAgent,
+    });
+
     return {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
+      accessToken,
+      session: {
+        id: session.id,
+        deviceType: session.deviceType,
+        expiresAt: session.expiresAt,
+      },
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        phone: user.phone,
+        avatar: user.avatar,
+      },
     };
   }
 

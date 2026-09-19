@@ -15,10 +15,12 @@ export class OrdersController {
     @Query('status') status?: OrderStatus,
     @Query('search') search?: string,
     @Query('customerId') customerId?: string,
+    @Query('customerEmail') customerEmail?: string,
+    @Query('customerPhone') customerPhone?: string,
     @Query('page') page?: number,
     @Query('limit') limit?: number,
   ) {
-    return this.ordersService.findAll({ status, search, customerId, page, limit });
+    return this.ordersService.findAll({ status, search, customerId, customerEmail, customerPhone, page, limit });
   }
 
   @Get(':id')

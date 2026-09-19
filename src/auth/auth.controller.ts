@@ -61,8 +61,13 @@ export class AuthController {
 
   @Post('register')
   @ApiOperation({ summary: 'Register a new staff/admin/customer user' })
-  async register(@Body() body: RegisterDto) {
-    return this.authService.register(body);
+  async register(@Body() body: RegisterDto, @Req() req: any) {
+    const ipAddress = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'];
+    return this.authService.register(body, {
+      ipAddress: Array.isArray(ipAddress) ? ipAddress[0] : ipAddress,
+      userAgent,
+    });
   }
 
   @Post('logout')
