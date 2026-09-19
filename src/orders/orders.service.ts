@@ -151,7 +151,7 @@ export class OrdersService {
     paymentStatus?: PaymentStatus;
     notes?: string;
     items: Array<{
-      productId: string;
+      productId?: string;
       productName: string;
       size?: string;
       quantity: number;
@@ -162,42 +162,92 @@ export class OrdersService {
       throw new BadRequestException('An order must contain at least one item.');
     }
 
-    // Auto-link or register Customer in CRM directory
-    let customerId = data.customerId || null;
-    if (!customerId && data.customerPhone) {
-      let customer = await this.prisma.customer.findUnique({
-        where: { phone: data.customerPhone },
+    const trimmedPhone = data.customerPhone ? data.customerPhone.trim() : '';
+    const trimmedEmail = data.customerEmail ? data.customerEmail.trim().toLowerCase() : null;
+
+    // Safely resolve Customer in CRM directory
+    let customerId: string | null = null;
+    if (data.customerId) {
+      const existingById = await this.prisma.customer.findUnique({
+        where: { id: data.customerId },
       });
-      if (!customer) {
-        customer = await this.prisma.customer.create({
-          data: {
-            name: data.customerName || 'Customer',
-            phone: data.customerPhone,
-            email: data.customerEmail || null,
-            address: data.shippingAddress || null,
-            type: 'RETAIL',
-          },
+      if (existingById) {
+        customerId = existingById.id;
+      }
+    }
+
+    if (!customerId && (trimmedPhone || trimmedEmail)) {
+      let customer = null;
+      if (trimmedPhone) {
+        customer = await this.prisma.customer.findUnique({
+          where: { phone: trimmedPhone },
         });
       }
-      customerId = customer.id;
+      if (!customer && trimmedEmail) {
+        customer = await this.prisma.customer.findUnique({
+          where: { email: trimmedEmail },
+        });
+      }
+      if (!customer && trimmedPhone) {
+        try {
+          customer = await this.prisma.customer.create({
+            data: {
+              name: data.customerName || 'Customer',
+              phone: trimmedPhone,
+              email: trimmedEmail,
+              address: data.shippingAddress || null,
+              type: 'RETAIL',
+            },
+          });
+        } catch (err) {
+          // If concurrent insert or unique conflict, fetch existing
+          customer = await this.prisma.customer.findFirst({
+            where: {
+              OR: [
+                { phone: trimmedPhone },
+                ...(trimmedEmail ? [{ email: trimmedEmail }] : []),
+              ],
+            },
+          });
+        }
+      }
+      if (customer) {
+        customerId = customer.id;
+      }
     }
 
     // 9-digit numeric order number format
     const orderNumber = Math.floor(100000000 + Math.random() * 900000000).toString();
 
+    // Safely validate and resolve line items
     let subtotal = 0;
-    const lineItems = data.items.map((item) => {
-      const lineTotal = item.quantity * item.unitPrice;
+    const validatedLineItems = [];
+
+    for (const item of data.items) {
+      let validProductId: string | null = null;
+      if (item.productId) {
+        const prod = await this.prisma.product.findUnique({
+          where: { id: item.productId },
+        });
+        if (prod) {
+          validProductId = prod.id;
+        }
+      }
+
+      const qty = Number(item.quantity) || 1;
+      const price = Number(item.unitPrice) || 0;
+      const lineTotal = qty * price;
       subtotal += lineTotal;
-      return {
-        productId: item.productId,
-        productName: item.productName,
+
+      validatedLineItems.push({
+        productId: validProductId,
+        productName: item.productName || 'Textile Item',
         size: item.size || 'Standard',
-        quantity: Number(item.quantity),
-        unitPrice: Number(item.unitPrice),
+        quantity: qty,
+        unitPrice: price,
         totalPrice: lineTotal,
-      };
-    });
+      });
+    }
 
     const taxAmount = Math.round(subtotal * 0.05); // 5% GST
     const discountAmount = 0;
@@ -209,8 +259,8 @@ export class OrdersService {
         orderNumber,
         customerId,
         customerName: data.customerName,
-        customerPhone: data.customerPhone,
-        customerEmail: data.customerEmail || null,
+        customerPhone: trimmedPhone || 'N/A',
+        customerEmail: trimmedEmail,
         shippingAddress: data.shippingAddress,
         paymentMethod: data.paymentMethod || 'ONLINE_GPAY',
         paymentStatus: PaymentStatus.PAID,
@@ -221,7 +271,7 @@ export class OrdersService {
         totalAmount,
         notes: data.notes || null,
         items: {
-          create: lineItems,
+          create: validatedLineItems,
         },
         history: {
           create: {
@@ -234,35 +284,43 @@ export class OrdersService {
       include: { items: true, customer: true, history: true },
     });
 
-    // Auto-deduct stock for each item & create audit log
-    for (const item of data.items) {
+    // Safely deduct stock for valid products & create audit log
+    for (const item of validatedLineItems) {
       if (item.productId) {
-        const prod = await this.prisma.product.findUnique({ where: { id: item.productId } });
-        if (prod) {
-          const newStock = Math.max(0, prod.stock - item.quantity);
-          await this.prisma.product.update({
-            where: { id: prod.id },
-            data: { stock: newStock },
-          });
-          await this.prisma.inventoryAudit.create({
-            data: {
-              productId: prod.id,
-              previousStock: prod.stock,
-              newStock,
-              delta: -item.quantity,
-              reason: 'Sale',
-              note: `Order #${orderNumber} confirmation deduction.`,
-              createdBy: 'Order Engine',
-            },
-          });
+        try {
+          const prod = await this.prisma.product.findUnique({ where: { id: item.productId } });
+          if (prod) {
+            const newStock = Math.max(0, prod.stock - item.quantity);
+            await this.prisma.product.update({
+              where: { id: prod.id },
+              data: { stock: newStock },
+            });
+            await this.prisma.inventoryAudit.create({
+              data: {
+                productId: prod.id,
+                previousStock: prod.stock,
+                newStock,
+                delta: -item.quantity,
+                reason: 'Sale',
+                note: `Order #${orderNumber} confirmation deduction.`,
+                createdBy: 'Order Engine',
+              },
+            });
+          }
+        } catch (stockErr) {
+          console.warn(`Failed to deduct inventory for product ${item.productId}:`, stockErr);
         }
       }
     }
 
-    await this.cache.invalidatePrefix('analytics:');
-    await this.cache.invalidatePrefix('inventory:');
-    await this.cache.invalidatePrefix('products:');
-    await this.cache.invalidatePrefix('crm:');
+    try {
+      await this.cache.invalidatePrefix('analytics:');
+      await this.cache.invalidatePrefix('inventory:');
+      await this.cache.invalidatePrefix('products:');
+      await this.cache.invalidatePrefix('crm:');
+    } catch (cacheErr) {
+      console.warn('Cache invalidation warning:', cacheErr);
+    }
 
     return order;
   }
