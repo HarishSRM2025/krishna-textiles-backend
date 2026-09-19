@@ -124,6 +124,7 @@ model Product {
   reviews       Int              @default(0)
   imageUrl      String?
   images        String[]         @default([])
+  colors        Json?            @default("[]")
   bestSeller    Boolean          @default(false)
   description   String?
   sizes         String[]
@@ -247,6 +248,7 @@ model OrderItem {
   productId   String?
   productName String
   size        String?
+  color       String?
   quantity    Int
   unitPrice   Float
   totalPrice  Float

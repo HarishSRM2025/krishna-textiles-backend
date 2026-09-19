@@ -184,7 +184,16 @@ export class ProductsService {
     const brandCode = (brandIdVal || brandName || 'KT').toUpperCase().slice(0, 3) || 'KT';
     const sku = data.sku || `KT-${brandCode}-${Math.floor(1000 + Math.random() * 9000)}`;
     const images = Array.isArray(data.images) ? data.images.slice(0, 5) : [];
-    const primaryImage = images[0] || data.imageUrl || 'https://images.unsplash.com/photo-1521572267360-ee0c2909d518?w=500';
+    const colorImages = Array.isArray((data as any).colors)
+      ? (data as any).colors.map((c: any) => c?.image).filter(Boolean)
+      : [];
+    const allImages = [...images];
+    for (const cImg of colorImages) {
+      if (!allImages.includes(cImg) && allImages.length < 5) {
+        allImages.push(cImg);
+      }
+    }
+    const primaryImage = allImages[0] || data.imageUrl || 'https://images.unsplash.com/photo-1521572267360-ee0c2909d518?w=500';
 
     const product = await this.prisma.product.create({
       data: {
@@ -204,7 +213,8 @@ export class ProductsService {
         description: data.description || null,
         sku,
         imageUrl: primaryImage,
-        images: images.length > 0 ? images : [primaryImage],
+        images: allImages.length > 0 ? allImages : [primaryImage],
+        colors: (data as any).colors || [],
         bestSeller: Boolean(data.bestSeller),
       },
       include: {
@@ -233,6 +243,7 @@ export class ProductsService {
     if (data.bestSeller !== undefined) updatePayload.bestSeller = Boolean(data.bestSeller);
     if (data.brandRefId !== undefined) updatePayload.brandRefId = data.brandRefId || null;
     if (data.brand !== undefined) updatePayload.brand = (data.brand || '').trim();
+    if (data.colors !== undefined) updatePayload.colors = data.colors;
     if (data.brandId !== undefined) {
       updatePayload.brandId = data.brandId ? data.brandId.toLowerCase() : '';
     }

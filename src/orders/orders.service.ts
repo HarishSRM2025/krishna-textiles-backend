@@ -90,7 +90,11 @@ export class OrdersService {
       this.prisma.order.findMany({
         where,
         include: {
-          items: true,
+          items: {
+            include: {
+              product: true,
+            },
+          },
           customer: true,
           history: {
             orderBy: { createdAt: 'desc' },
@@ -154,6 +158,7 @@ export class OrdersService {
       productId?: string;
       productName: string;
       size?: string;
+      color?: string;
       quantity: number;
       unitPrice: number;
     }>;
@@ -243,6 +248,7 @@ export class OrdersService {
         productId: validProductId,
         productName: item.productName || 'Textile Item',
         size: item.size || 'Standard',
+        color: item.color || null,
         quantity: qty,
         unitPrice: price,
         totalPrice: lineTotal,
@@ -281,7 +287,7 @@ export class OrdersService {
           },
         },
       },
-      include: { items: true, customer: true, history: true },
+      include: { items: { include: { product: true } }, customer: true, history: true },
     });
 
     // Safely deduct stock for valid products & create audit log
@@ -409,7 +415,7 @@ export class OrdersService {
     const updated = await this.prisma.order.update({
       where: { id: order.id },
       data: updateData,
-      include: { items: true, customer: true, history: true },
+      include: { items: { include: { product: true } }, customer: true, history: true },
     });
 
     // Build descriptive timeline note
