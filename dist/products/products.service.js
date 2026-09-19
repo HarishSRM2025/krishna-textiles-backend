@@ -1,0 +1,255 @@
+"use strict";
+var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
+    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+    if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+    return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ProductsService = void 0;
+const common_1 = require("@nestjs/common");
+const prisma_service_1 = require("../prisma/prisma.service");
+const custom_cache_service_1 = require("../cache/custom-cache.service");
+let ProductsService = class ProductsService {
+    constructor(prisma, cache) {
+        this.prisma = prisma;
+        this.cache = cache;
+    }
+    async findAll(params) {
+        const page = params.page ? Number(params.page) : 1;
+        const limit = params.limit ? Number(params.limit) : 50;
+        const skip = (page - 1) * limit;
+        const andConditions = [];
+        if (params.category && params.category !== 'all') {
+            andConditions.push({
+                OR: [
+                    { category: { equals: params.category, mode: 'insensitive' } },
+                    { categoryId: params.category },
+                    { categoryRef: { slug: params.category } },
+                    { categoryRef: { name: { equals: params.category, mode: 'insensitive' } } },
+                ],
+            });
+        }
+        if (params.categoryId && params.categoryId !== 'all') {
+            andConditions.push({
+                OR: [
+                    { categoryId: params.categoryId },
+                    { categoryRef: { slug: params.categoryId } },
+                ],
+            });
+        }
+        if (params.brandId && params.brandId !== 'all') {
+            andConditions.push({
+                OR: [
+                    { brandId: params.brandId },
+                    { brandRefId: params.brandId },
+                    { brand: { equals: params.brandId, mode: 'insensitive' } },
+                    { brandRef: { slug: params.brandId } },
+                    { brandRef: { name: { equals: params.brandId, mode: 'insensitive' } } },
+                ],
+            });
+        }
+        if (params.brandRefId && params.brandRefId !== 'all') {
+            andConditions.push({
+                OR: [
+                    { brandRefId: params.brandRefId },
+                    { brandRef: { slug: params.brandRefId } },
+                ],
+            });
+        }
+        if (params.search && params.search.trim()) {
+            const q = params.search.trim();
+            andConditions.push({
+                OR: [
+                    { name: { contains: q, mode: 'insensitive' } },
+                    { brand: { contains: q, mode: 'insensitive' } },
+                    { sku: { contains: q, mode: 'insensitive' } },
+                    { description: { contains: q, mode: 'insensitive' } },
+                ],
+            });
+        }
+        if (params.minPrice || params.maxPrice) {
+            const priceFilter = {};
+            if (params.minPrice)
+                priceFilter.gte = Number(params.minPrice);
+            if (params.maxPrice)
+                priceFilter.lte = Number(params.maxPrice);
+            andConditions.push({ price: priceFilter });
+        }
+        if (params.stockStatus && params.stockStatus !== 'all') {
+            if (params.stockStatus === 'low' || params.stockStatus === 'low_stock') {
+                andConditions.push({ stock: { gt: 0, lt: 20 } });
+            }
+            else if (params.stockStatus === 'medium' || params.stockStatus === 'medium_stock') {
+                andConditions.push({ stock: { equals: 20 } });
+            }
+            else if (params.stockStatus === 'high' || params.stockStatus === 'high_stock') {
+                andConditions.push({ stock: { gt: 20 } });
+            }
+            else if (params.stockStatus === 'out_of_stock' || params.stockStatus === 'out') {
+                andConditions.push({ stock: { lte: 0 } });
+            }
+        }
+        const where = andConditions.length > 0 ? { AND: andConditions } : {};
+        const [total, products] = await Promise.all([
+            this.prisma.product.count({ where }),
+            this.prisma.product.findMany({
+                where,
+                include: {
+                    categoryRef: true,
+                    brandRef: true,
+                },
+                orderBy: { createdAt: 'desc' },
+                skip,
+                take: limit,
+            }),
+        ]);
+        return {
+            products,
+            total,
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit),
+        };
+    }
+    async findOne(id) {
+        const cacheKey = `products:${id}`;
+        const cached = await this.cache.get(cacheKey);
+        if (cached)
+            return cached;
+        const product = await this.prisma.product.findFirst({
+            where: {
+                OR: [{ id }, { slug: id }, { sku: id }],
+            },
+            include: {
+                categoryRef: true,
+                brandRef: true,
+            },
+        });
+        if (!product)
+            throw new common_1.NotFoundException(`Product with ID '${id}' not found`);
+        await this.cache.set(cacheKey, product, 300);
+        return product;
+    }
+    async getCategories() {
+        return this.prisma.category.findMany({
+            include: {
+                _count: { select: { products: true } },
+            },
+            orderBy: { name: 'asc' },
+        });
+    }
+    async getBrands() {
+        return this.prisma.brand.findMany({
+            include: {
+                _count: { select: { products: true } },
+            },
+            orderBy: { name: 'asc' },
+        });
+    }
+    async create(data) {
+        const slug = `${Date.now()}-${data.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}`;
+        const brandName = (data.brand || '').trim();
+        const brandIdVal = data.brandId
+            ? data.brandId.toLowerCase()
+            : (brandName ? brandName.toLowerCase().replace(/[^a-z0-9]/g, '-') : '');
+        const brandCode = (brandIdVal || brandName || 'KT').toUpperCase().slice(0, 3) || 'KT';
+        const sku = data.sku || `KT-${brandCode}-${Math.floor(1000 + Math.random() * 9000)}`;
+        const images = Array.isArray(data.images) ? data.images.slice(0, 5) : [];
+        const primaryImage = images[0] || data.imageUrl || 'https://images.unsplash.com/photo-1521572267360-ee0c2909d518?w=500';
+        const product = await this.prisma.product.create({
+            data: {
+                name: data.name,
+                slug,
+                brand: brandName,
+                brandId: brandIdVal,
+                brandRefId: data.brandRefId || null,
+                category: data.category.toLowerCase(),
+                categoryId: data.categoryId || null,
+                price: Number(data.price),
+                mrp: Number(data.mrp),
+                discount: Number(data.discount) || Math.round(((data.mrp - data.price) / data.mrp) * 100),
+                sizes: data.sizes || ['Free Size'],
+                stock: Number(data.stock) || 0,
+                minStockAlert: Number(data.minStockAlert) || 20,
+                description: data.description || null,
+                sku,
+                imageUrl: primaryImage,
+                images: images.length > 0 ? images : [primaryImage],
+                bestSeller: Boolean(data.bestSeller),
+            },
+            include: {
+                categoryRef: true,
+                brandRef: true,
+            },
+        });
+        await this.cache.invalidatePrefix('products:');
+        await this.cache.invalidatePrefix('analytics:');
+        await this.cache.invalidatePrefix('inventory:');
+        return product;
+    }
+    async update(id, data) {
+        const existing = await this.prisma.product.findUnique({ where: { id } });
+        if (!existing)
+            throw new common_1.NotFoundException(`Product with ID '${id}' not found`);
+        const updatePayload = { ...data };
+        if (data.price !== undefined)
+            updatePayload.price = Number(data.price);
+        if (data.mrp !== undefined)
+            updatePayload.mrp = Number(data.mrp);
+        if (data.stock !== undefined)
+            updatePayload.stock = Number(data.stock);
+        if (data.minStockAlert !== undefined)
+            updatePayload.minStockAlert = Number(data.minStockAlert);
+        if (data.discount !== undefined)
+            updatePayload.discount = Number(data.discount);
+        if (data.bestSeller !== undefined)
+            updatePayload.bestSeller = Boolean(data.bestSeller);
+        if (data.brandRefId !== undefined)
+            updatePayload.brandRefId = data.brandRefId || null;
+        if (data.brand !== undefined)
+            updatePayload.brand = (data.brand || '').trim();
+        if (data.brandId !== undefined) {
+            updatePayload.brandId = data.brandId ? data.brandId.toLowerCase() : '';
+        }
+        if (data.images !== undefined && Array.isArray(data.images)) {
+            const images = data.images.slice(0, 5);
+            updatePayload.images = images;
+            if (images.length > 0) {
+                updatePayload.imageUrl = images[0];
+            }
+        }
+        const updated = await this.prisma.product.update({
+            where: { id },
+            data: updatePayload,
+            include: {
+                categoryRef: true,
+                brandRef: true,
+            },
+        });
+        await this.cache.invalidatePrefix('products:');
+        await this.cache.invalidatePrefix('analytics:');
+        await this.cache.invalidatePrefix('inventory:');
+        return updated;
+    }
+    async remove(id) {
+        const existing = await this.prisma.product.findUnique({ where: { id } });
+        if (!existing)
+            throw new common_1.NotFoundException(`Product with ID '${id}' not found`);
+        await this.prisma.product.delete({ where: { id } });
+        await this.cache.invalidatePrefix('products:');
+        await this.cache.invalidatePrefix('analytics:');
+        await this.cache.invalidatePrefix('inventory:');
+        return { success: true, message: `Product ${existing.name} deleted` };
+    }
+};
+exports.ProductsService = ProductsService;
+exports.ProductsService = ProductsService = __decorate([
+    (0, common_1.Injectable)(),
+    __metadata("design:paramtypes", [prisma_service_1.PrismaService,
+        custom_cache_service_1.CustomCacheService])
+], ProductsService);
+//# sourceMappingURL=products.service.js.map

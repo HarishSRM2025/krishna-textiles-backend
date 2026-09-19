@@ -1,0 +1,414 @@
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { CustomCacheService } from '../cache/custom-cache.service';
+import { OrderStatus, PaymentStatus } from '@prisma/client';
+
+@Injectable()
+export class OrdersService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cache: CustomCacheService,
+  ) {}
+
+  async onModuleInit() {
+    await this.syncOrphanOrdersToCustomers();
+  }
+
+  async syncOrphanOrdersToCustomers() {
+    try {
+      const orphanOrders = await this.prisma.order.findMany({
+        where: { customerId: null },
+      });
+      for (const o of orphanOrders) {
+        if (o.customerPhone) {
+          let customer = await this.prisma.customer.findUnique({
+            where: { phone: o.customerPhone },
+          });
+          if (!customer) {
+            customer = await this.prisma.customer.create({
+              data: {
+                name: o.customerName || 'Customer',
+                phone: o.customerPhone,
+                email: o.customerEmail || null,
+                address: o.shippingAddress || null,
+                type: 'RETAIL',
+              },
+            });
+          }
+          await this.prisma.order.update({
+            where: { id: o.id },
+            data: { customerId: customer.id },
+          });
+        }
+      }
+    } catch (err) {
+      console.error('Error syncing orphan orders to customers:', err);
+    }
+  }
+
+  async findAll(params: {
+    status?: OrderStatus;
+    search?: string;
+    customerId?: string;
+    page?: number;
+    limit?: number;
+  }) {
+    const page = params.page ? Number(params.page) : 1;
+    const limit = params.limit ? Number(params.limit) : 15;
+    const skip = (page - 1) * limit;
+
+    const where: any = {};
+    if (params.status && params.status !== ('ALL' as any)) {
+      if ((params.status as string) === 'CONFIRMED' || (params.status as string) === 'PENDING') {
+        where.status = { in: ['CONFIRMED', 'PENDING'] };
+      } else {
+        where.status = params.status;
+      }
+    }
+    if (params.customerId) {
+      where.customerId = params.customerId;
+    }
+    if (params.search) {
+      where.OR = [
+        { orderNumber: { contains: params.search, mode: 'insensitive' } },
+        { customerName: { contains: params.search, mode: 'insensitive' } },
+        { customerPhone: { contains: params.search, mode: 'insensitive' } },
+        { customerEmail: { contains: params.search, mode: 'insensitive' } },
+      ];
+    }
+
+    const [total, orders] = await Promise.all([
+      this.prisma.order.count({ where }),
+      this.prisma.order.findMany({
+        where,
+        include: {
+          items: true,
+          customer: true,
+          history: {
+            orderBy: { createdAt: 'desc' },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    return {
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+      orders,
+    };
+  }
+
+  async findOne(id: string) {
+    const order = await this.prisma.order.findFirst({
+      where: {
+        OR: [{ id }, { orderNumber: id }],
+      },
+      include: {
+        items: {
+          include: {
+            product: true,
+          },
+        },
+        customer: true,
+        history: {
+          orderBy: { createdAt: 'desc' },
+        },
+      },
+    });
+
+    if (!order) throw new NotFoundException(`Order '${id}' not found`);
+    return order;
+  }
+
+  async getOrderHistory(id: string) {
+    const order = await this.findOne(id);
+    return this.prisma.orderStatusHistory.findMany({
+      where: { orderId: order.id },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async create(data: {
+    customerId?: string;
+    customerName: string;
+    customerPhone: string;
+    customerEmail?: string;
+    shippingAddress: string;
+    paymentMethod?: string;
+    paymentStatus?: PaymentStatus;
+    notes?: string;
+    items: Array<{
+      productId: string;
+      productName: string;
+      size?: string;
+      quantity: number;
+      unitPrice: number;
+    }>;
+  }) {
+    if (!data.items || data.items.length === 0) {
+      throw new BadRequestException('An order must contain at least one item.');
+    }
+
+    // Auto-link or register Customer in CRM directory
+    let customerId = data.customerId || null;
+    if (!customerId && data.customerPhone) {
+      let customer = await this.prisma.customer.findUnique({
+        where: { phone: data.customerPhone },
+      });
+      if (!customer) {
+        customer = await this.prisma.customer.create({
+          data: {
+            name: data.customerName || 'Customer',
+            phone: data.customerPhone,
+            email: data.customerEmail || null,
+            address: data.shippingAddress || null,
+            type: 'RETAIL',
+          },
+        });
+      }
+      customerId = customer.id;
+    }
+
+    // 9-digit numeric order number format
+    const orderNumber = Math.floor(100000000 + Math.random() * 900000000).toString();
+
+    let subtotal = 0;
+    const lineItems = data.items.map((item) => {
+      const lineTotal = item.quantity * item.unitPrice;
+      subtotal += lineTotal;
+      return {
+        productId: item.productId,
+        productName: item.productName,
+        size: item.size || 'Standard',
+        quantity: Number(item.quantity),
+        unitPrice: Number(item.unitPrice),
+        totalPrice: lineTotal,
+      };
+    });
+
+    const taxAmount = Math.round(subtotal * 0.05); // 5% GST
+    const discountAmount = 0;
+    const totalAmount = subtotal + taxAmount - discountAmount;
+
+    // Order placed only when payment is paid; initial fulfillment stage is Dispatch Pending (CONFIRMED)
+    const order = await this.prisma.order.create({
+      data: {
+        orderNumber,
+        customerId,
+        customerName: data.customerName,
+        customerPhone: data.customerPhone,
+        customerEmail: data.customerEmail || null,
+        shippingAddress: data.shippingAddress,
+        paymentMethod: data.paymentMethod || 'ONLINE_GPAY',
+        paymentStatus: PaymentStatus.PAID,
+        status: OrderStatus.CONFIRMED, // Dispatch Pending
+        subtotal,
+        taxAmount,
+        discountAmount,
+        totalAmount,
+        notes: data.notes || null,
+        items: {
+          create: lineItems,
+        },
+        history: {
+          create: {
+            status: OrderStatus.CONFIRMED,
+            note: 'Order placed & payment verified. Awaiting dispatch.',
+            changedBy: 'System',
+          },
+        },
+      },
+      include: { items: true, customer: true, history: true },
+    });
+
+    // Auto-deduct stock for each item & create audit log
+    for (const item of data.items) {
+      if (item.productId) {
+        const prod = await this.prisma.product.findUnique({ where: { id: item.productId } });
+        if (prod) {
+          const newStock = Math.max(0, prod.stock - item.quantity);
+          await this.prisma.product.update({
+            where: { id: prod.id },
+            data: { stock: newStock },
+          });
+          await this.prisma.inventoryAudit.create({
+            data: {
+              productId: prod.id,
+              previousStock: prod.stock,
+              newStock,
+              delta: -item.quantity,
+              reason: 'Sale',
+              note: `Order #${orderNumber} confirmation deduction.`,
+              createdBy: 'Order Engine',
+            },
+          });
+        }
+      }
+    }
+
+    await this.cache.invalidatePrefix('analytics:');
+    await this.cache.invalidatePrefix('inventory:');
+    await this.cache.invalidatePrefix('products:');
+    await this.cache.invalidatePrefix('crm:');
+
+    return order;
+  }
+
+  async updateStatus(
+    id: string, 
+    status: OrderStatus, 
+    trackingNumber?: string, 
+    note?: string,
+    courierPartner?: string,
+    dispatchedAt?: string,
+    expectedDeliveryDate?: string
+  ) {
+    const order = await this.prisma.order.findFirst({
+      where: { OR: [{ id }, { orderNumber: id }] },
+      include: { items: true },
+    });
+    if (!order) throw new NotFoundException(`Order '${id}' not found`);
+
+    const validFulfillmentStatuses: OrderStatus[] = [
+      OrderStatus.CONFIRMED,
+      OrderStatus.PROCESSING,
+      OrderStatus.PENDING,
+      OrderStatus.DISPATCHED,
+      OrderStatus.DELIVERED,
+      OrderStatus.CANCELLED,
+    ];
+    if (!validFulfillmentStatuses.includes(status)) {
+      throw new BadRequestException(`Invalid fulfillment status: ${status}. Supported stages: Dispatch Pending, Processing, Shipped, Delivered, Cancelled.`);
+    }
+
+    // If order is cancelled, restore item stock
+    if (status === OrderStatus.CANCELLED && order.status !== OrderStatus.CANCELLED) {
+      for (const item of order.items) {
+        if (item.productId) {
+          const prod = await this.prisma.product.findUnique({ where: { id: item.productId } });
+          if (prod) {
+            const newStock = prod.stock + item.quantity;
+            await this.prisma.product.update({
+              where: { id: prod.id },
+              data: { stock: newStock },
+            });
+            await this.prisma.inventoryAudit.create({
+              data: {
+                productId: prod.id,
+                previousStock: prod.stock,
+                newStock,
+                delta: item.quantity,
+                reason: 'Cancellation Restock',
+                note: `Order #${order.orderNumber} cancelled. Stock restored.`,
+                createdBy: 'Admin Order Engine',
+              },
+            });
+          }
+        }
+      }
+    }
+
+    const updateData: any = { status };
+
+    if (trackingNumber !== undefined) {
+      updateData.trackingNumber = trackingNumber;
+    }
+    if (courierPartner !== undefined) {
+      updateData.courierPartner = courierPartner;
+    }
+
+    // When moving to Shipped (DISPATCHED), Expected Delivery Date defaults to +3 days if not provided
+    if (status === OrderStatus.DISPATCHED) {
+      const defaultExpDate = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+      const expDate = expectedDeliveryDate || (order.expectedDeliveryDate ? order.expectedDeliveryDate.toISOString() : defaultExpDate);
+      updateData.expectedDeliveryDate = new Date(expDate);
+      updateData.dispatchedAt = dispatchedAt ? new Date(dispatchedAt) : (order.dispatchedAt || new Date());
+    } else if (expectedDeliveryDate !== undefined) {
+      updateData.expectedDeliveryDate = expectedDeliveryDate ? new Date(expectedDeliveryDate) : null;
+    }
+
+    if (dispatchedAt !== undefined && status !== OrderStatus.DISPATCHED) {
+      updateData.dispatchedAt = dispatchedAt ? new Date(dispatchedAt) : null;
+    }
+
+    if (status === OrderStatus.DELIVERED) {
+      updateData.paymentStatus = PaymentStatus.PAID;
+    }
+
+    const updated = await this.prisma.order.update({
+      where: { id: order.id },
+      data: updateData,
+      include: { items: true, customer: true, history: true },
+    });
+
+    // Build descriptive timeline note
+    let historyNote = note;
+    if (!historyNote) {
+      const details = [];
+      if (courierPartner || updated.courierPartner) details.push(`Courier: ${courierPartner || updated.courierPartner}`);
+      if (trackingNumber || updated.trackingNumber) details.push(`AWB: ${trackingNumber || updated.trackingNumber}`);
+      if (updateData.expectedDeliveryDate || updated.expectedDeliveryDate) {
+        details.push(`Est. Delivery: ${new Date(updateData.expectedDeliveryDate || updated.expectedDeliveryDate).toLocaleDateString('en-IN')}`);
+      }
+      const label = status === OrderStatus.DISPATCHED ? 'Shipped' : status === OrderStatus.DELIVERED ? 'Delivered' : status === OrderStatus.PROCESSING ? 'Processing' : status === OrderStatus.CANCELLED ? 'Cancelled' : 'Dispatch Pending';
+      historyNote = details.length > 0 
+        ? `Stage changed to ${label} (${details.join(', ')})`
+        : `Stage changed to ${label}`;
+    }
+
+    // Record timeline history
+    await this.prisma.orderStatusHistory.create({
+      data: {
+        orderId: order.id,
+        status,
+        note: historyNote,
+        changedBy: 'Admin',
+      },
+    });
+
+    await this.cache.invalidatePrefix('analytics:');
+    await this.cache.invalidatePrefix('inventory:');
+    await this.cache.invalidatePrefix('crm:');
+    return updated;
+  }
+
+  async updatePayment(id: string, paymentStatus: PaymentStatus, paymentMethod?: string) {
+    const order = await this.prisma.order.findFirst({
+      where: { OR: [{ id }, { orderNumber: id }] },
+    });
+    if (!order) throw new NotFoundException(`Order '${id}' not found`);
+
+    return this.prisma.order.update({
+      where: { id: order.id },
+      data: {
+        paymentStatus,
+        paymentMethod: paymentMethod || order.paymentMethod,
+      },
+      include: { items: true, history: true },
+    });
+  }
+
+  async getInvoiceData(id: string) {
+    const order = await this.findOne(id);
+    return {
+      company: {
+        name: 'Krishna Textiles Pvt Ltd',
+        tagline: 'Leading Textile Manufacturers & Hosiery Wholesalers',
+        gstin: '33AAACK9911D1ZX',
+        pan: 'AAACK9911D',
+        address: '88/4, Tiruppur Main Textile Complex',
+        city: 'Tiruppur',
+        state: 'Tamil Nadu - 641604',
+        phone: '+91 421 249 8899',
+        email: 'billing@krishnatextiles.com',
+        website: 'www.krishnatextiles.com',
+      },
+      order,
+    };
+  }
+}
