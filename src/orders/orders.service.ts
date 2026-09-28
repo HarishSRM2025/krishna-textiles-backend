@@ -3,7 +3,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CustomCacheService } from '../cache/custom-cache.service';
 import { OrderStatus, PaymentStatus } from '@prisma/client';
 import * as crypto from 'crypto';
-import Razorpay from 'razorpay';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const Razorpay = require('razorpay');
 
 @Injectable()
 export class OrdersService {
