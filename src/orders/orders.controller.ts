@@ -23,6 +23,39 @@ export class OrdersController {
     return this.ordersService.findAll({ status, search, customerId, customerEmail, customerPhone, page, limit });
   }
 
+  @Get('razorpay/config')
+  @ApiOperation({ summary: 'Get Razorpay public configuration (keyId)' })
+  getRazorpayConfig() {
+    const config = this.ordersService.getRazorpayConfig();
+    return { success: true, data: config };
+  }
+
+  @Post('razorpay/create-order')
+  @ApiOperation({ summary: 'Create a Razorpay order before initiating payment' })
+  async createRazorpayOrder(@Body() body: { amount: number; receipt?: string; notes?: Record<string, string> }) {
+    const data = await this.ordersService.createRazorpayOrder(body.amount, body.receipt, body.notes);
+    return { success: true, data };
+  }
+
+  @Post('razorpay/verify')
+  @ApiOperation({ summary: 'Verify Razorpay payment signature and complete order placement' })
+  async verifyRazorpayPayment(
+    @Body()
+    body: {
+      razorpayOrderId: string;
+      razorpayPaymentId: string;
+      razorpaySignature: string;
+      orderData: any;
+    },
+  ) {
+    const order = await this.ordersService.verifyAndCreateOrder(body);
+    return {
+      success: true,
+      message: `Payment verified & order ${order.orderNumber} placed successfully`,
+      data: order,
+    };
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get order details with line items' })
   async findOne(@Param('id') id: string) {

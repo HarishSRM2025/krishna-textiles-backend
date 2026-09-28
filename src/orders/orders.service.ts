@@ -2,6 +2,8 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { PrismaService } from '../prisma/prisma.service';
 import { CustomCacheService } from '../cache/custom-cache.service';
 import { OrderStatus, PaymentStatus } from '@prisma/client';
+import * as crypto from 'crypto';
+import Razorpay from 'razorpay';
 
 @Injectable()
 export class OrdersService {
@@ -145,6 +147,100 @@ export class OrdersService {
     });
   }
 
+  private razorpayInstance: any = null;
+
+  private getRazorpay(): any {
+    if (!this.razorpayInstance) {
+      const key_id = process.env.RAZORPAY_KEY_ID || 'rzp_test_ThMMNStuG17mBM';
+      const key_secret = process.env.RAZORPAY_KEY_SECRET || 'Zj0mB3pCNaU2A5P4ilzozqxb';
+      this.razorpayInstance = new Razorpay({
+        key_id,
+        key_secret,
+      });
+    }
+    return this.razorpayInstance;
+  }
+
+  getRazorpayConfig() {
+    return {
+      keyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_ThMMNStuG17mBM',
+      currency: 'INR',
+    };
+  }
+
+  async createRazorpayOrder(amount: number, receipt?: string, notes?: Record<string, string>) {
+    if (!amount || Number(amount) <= 0) {
+      throw new BadRequestException('Amount must be greater than zero');
+    }
+    const rzp = this.getRazorpay();
+    const amountInPaise = Math.round(Number(amount) * 100);
+    const options = {
+      amount: amountInPaise,
+      currency: 'INR',
+      receipt: receipt || `kt_rcpt_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+      payment_capture: 1,
+      notes: notes || {},
+    };
+    try {
+      const razorpayOrder = await rzp.orders.create(options);
+      return {
+        id: razorpayOrder.id,
+        amount: razorpayOrder.amount,
+        currency: razorpayOrder.currency,
+        receipt: razorpayOrder.receipt,
+        keyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_ThMMNStuG17mBM',
+      };
+    } catch (err: any) {
+      console.error('Razorpay order creation error:', err);
+      throw new BadRequestException(
+        err?.error?.description || err.message || 'Razorpay order creation failed'
+      );
+    }
+  }
+
+  verifyRazorpaySignature(
+    razorpayOrderId: string,
+    razorpayPaymentId: string,
+    razorpaySignature: string,
+  ): boolean {
+    const key_secret = process.env.RAZORPAY_KEY_SECRET || 'Zj0mB3pCNaU2A5P4ilzozqxb';
+    const body = `${razorpayOrderId}|${razorpayPaymentId}`;
+    const expectedSignature = crypto
+      .createHmac('sha256', key_secret)
+      .update(body.toString())
+      .digest('hex');
+
+    return expectedSignature === razorpaySignature;
+  }
+
+  async verifyAndCreateOrder(payload: {
+    razorpayOrderId: string;
+    razorpayPaymentId: string;
+    razorpaySignature: string;
+    orderData: any;
+  }) {
+    const isValid = this.verifyRazorpaySignature(
+      payload.razorpayOrderId,
+      payload.razorpayPaymentId,
+      payload.razorpaySignature,
+    );
+
+    if (!isValid) {
+      throw new BadRequestException('Payment verification failed. Invalid Razorpay signature.');
+    }
+
+    const orderPayload = {
+      ...payload.orderData,
+      paymentMethod: 'RAZORPAY',
+      paymentStatus: PaymentStatus.PAID,
+      razorpayOrderId: payload.razorpayOrderId,
+      razorpayPaymentId: payload.razorpayPaymentId,
+      razorpaySignature: payload.razorpaySignature,
+    };
+
+    return this.create(orderPayload);
+  }
+
   async create(data: {
     customerId?: string;
     customerName: string;
@@ -154,6 +250,9 @@ export class OrdersService {
     paymentMethod?: string;
     paymentStatus?: PaymentStatus;
     notes?: string;
+    razorpayOrderId?: string;
+    razorpayPaymentId?: string;
+    razorpaySignature?: string;
     items: Array<{
       productId?: string;
       productName: string;
@@ -259,7 +358,20 @@ export class OrdersService {
     const discountAmount = 0;
     const totalAmount = subtotal + taxAmount - discountAmount;
 
-    // Order placed only when payment is paid; initial fulfillment stage is Dispatch Pending (CONFIRMED)
+    const isCod = data.paymentMethod === 'CASH_ON_DELIVERY';
+    const resolvedPaymentStatus = data.paymentStatus
+      ? data.paymentStatus
+      : isCod
+        ? PaymentStatus.UNPAID
+        : PaymentStatus.PAID;
+
+    const historyNote = data.paymentMethod === 'RAZORPAY'
+      ? `Order placed & payment verified via Razorpay (${data.razorpayPaymentId || 'Online'}). Awaiting dispatch.`
+      : isCod
+        ? 'Order placed via Cash on Delivery. Payment pending upon delivery.'
+        : 'Order placed & payment verified. Awaiting dispatch.';
+
+    // Order placed into database; initial fulfillment stage is Dispatch Pending (CONFIRMED)
     const order = await this.prisma.order.create({
       data: {
         orderNumber,
@@ -268,21 +380,24 @@ export class OrdersService {
         customerPhone: trimmedPhone || 'N/A',
         customerEmail: trimmedEmail,
         shippingAddress: data.shippingAddress,
-        paymentMethod: data.paymentMethod || 'ONLINE_GPAY',
-        paymentStatus: PaymentStatus.PAID,
+        paymentMethod: data.paymentMethod || 'RAZORPAY',
+        paymentStatus: resolvedPaymentStatus,
         status: OrderStatus.CONFIRMED, // Dispatch Pending
         subtotal,
         taxAmount,
         discountAmount,
         totalAmount,
         notes: data.notes || null,
+        razorpayOrderId: data.razorpayOrderId || null,
+        razorpayPaymentId: data.razorpayPaymentId || null,
+        razorpaySignature: data.razorpaySignature || null,
         items: {
           create: validatedLineItems,
         },
         history: {
           create: {
             status: OrderStatus.CONFIRMED,
-            note: 'Order placed & payment verified. Awaiting dispatch.',
+            note: historyNote,
             changedBy: 'System',
           },
         },
